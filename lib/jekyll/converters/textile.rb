@@ -1,7 +1,7 @@
 module Jekyll
 
   class TextileConverter < Converter
-    safe true
+    safe false
 
     pygments_prefix '<notextile>'
     pygments_suffix '</notextile>'

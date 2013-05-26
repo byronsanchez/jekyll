@@ -1,7 +1,7 @@
 module Jekyll
 
   class IdentityConverter < Converter
-    safe true
+    safe false
 
     priority :lowest
 
