@@ -1,11 +1,9 @@
-require 'set'
-
 module Jekyll
-
   class Site
     attr_accessor :config, :layouts, :posts, :pages, :static_files,
                   :categories, :exclude, :include, :source, :dest, :lsi, :pygments,
-                  :permalink_style, :tags, :time, :future, :safe, :plugins, :limit_posts
+                  :permalink_style, :tags, :time, :future, :safe, :plugins, :limit_posts,
+                  :show_drafts, :keep_files, :baseurl, :data, :file_read_opts, :gems
 
     attr_accessor :converters, :generators
 
@@ -15,17 +13,17 @@ module Jekyll
     def initialize(config)
       self.config          = config.clone
 
-      self.safe            = config['safe']
+      %w[safe lsi pygments baseurl exclude include future show_drafts limit_posts keep_files gems].each do |opt|
+        self.send("#{opt}=", config[opt])
+      end
+
       self.source          = File.expand_path(config['source'])
       self.dest            = File.expand_path(config['destination'])
-      self.plugins         = Array(config['plugins']).map { |d| File.expand_path(d) }
-      self.lsi             = config['lsi']
-      self.pygments        = config['pygments']
+      self.plugins         = plugins_path
       self.permalink_style = config['permalink'].to_sym
-      self.exclude         = config['exclude'] || []
-      self.include         = config['include'] || []
-      self.future          = config['future']
-      self.limit_posts     = config['limit_posts'] || nil
+
+      self.file_read_opts = {}
+      self.file_read_opts[:encoding] = config['encoding'] if config['encoding']
 
       self.reset
       self.setup
@@ -58,9 +56,10 @@ module Jekyll
       self.static_files    = []
       self.categories      = Hash.new { |hash, key| hash[key] = [] }
       self.tags            = Hash.new { |hash, key| hash[key] = [] }
+      self.data            = {}
 
-      if !self.limit_posts.nil? && self.limit_posts < 1
-        raise ArgumentError, "Limit posts must be nil or >= 1"
+      if self.limit_posts < 0
+        raise ArgumentError, "limit_posts must be a non-negative number"
       end
     end
 
@@ -68,7 +67,7 @@ module Jekyll
     #
     # Returns nothing.
     def setup
-      require 'classifier' if self.lsi
+      ensure_not_in_dest
 
       # If safe mode is off, load in any Ruby files under the plugins
       # directory.
@@ -78,18 +77,34 @@ module Jekyll
               require f
             end
         end
+        self.gems.each do |gem|
+          require gem
+        end
       end
 
-      self.converters = Jekyll::Converter.subclasses.select do |c|
-        !self.safe || c.safe
-      end.map do |c|
-        c.new(self.config)
-      end
+      self.converters = instantiate_subclasses(Jekyll::Converter)
+      self.generators = instantiate_subclasses(Jekyll::Generator)
+    end
 
-      self.generators = Jekyll::Generator.subclasses.select do |c|
-        !self.safe || c.safe
-      end.map do |c|
-        c.new(self.config)
+    # Check that the destination dir isn't the source dir or a directory
+    # parent to the source dir.
+    def ensure_not_in_dest
+      dest = Pathname.new(self.dest)
+      Pathname.new(self.source).ascend do |path|
+        if path == dest
+          raise FatalException.new "Destination directory cannot be or contain the Source directory."
+        end
+      end
+    end
+
+    # Internal: Setup the plugin search path
+    #
+    # Returns an Array of plugin search paths
+    def plugins_path
+      if (config['plugins'] == Jekyll::Configuration::DEFAULTS['plugins'])
+        [File.join(self.source, config['plugins'])]
+      else
+        Array(config['plugins']).map { |d| File.expand_path(d) }
       end
     end
 
@@ -99,6 +114,7 @@ module Jekyll
     def read
       self.read_layouts
       self.read_directories
+      self.read_data(config['data_source'])
     end
 
     # Read all the files in <source>/<layouts> and create a new Layout object
@@ -109,7 +125,7 @@ module Jekyll
       base = File.join(self.source, self.config['layouts'])
       return unless File.exists?(base)
       entries = []
-      Dir.chdir(base) { entries = filter_entries(Dir['*.*']) }
+      Dir.chdir(base) { entries = filter_entries(Dir['**/*.*']) }
 
       entries.each do |f|
         name = f.split(".")[0..-2].join(".")
@@ -129,22 +145,19 @@ module Jekyll
       entries = Dir.chdir(base) { filter_entries(Dir.entries('.')) }
 
       self.read_posts(dir)
+      self.read_drafts(dir) if self.show_drafts
+      self.posts.sort!
+      limit_posts! if limit_posts > 0 # limit the posts if :limit_posts option is set
 
       entries.each do |f|
         f_abs = File.join(base, f)
-        f_rel = File.join(dir, f)
         if File.directory?(f_abs)
-          next if self.dest.sub(/\/$/, '') == f_abs
-          read_directories(f_rel)
-        elsif !File.symlink?(f_abs)
-          first3 = File.open(f_abs) { |fd| fd.read(3) }
-          if first3 == "---"
-            # file appears to have a YAML header so process it as a page
-            pages << Page.new(self, self.source, dir, f)
-          else
-            # otherwise treat it as a static file
-            static_files << StaticFile.new(self, self.source, dir, f)
-          end
+          f_rel = File.join(dir, f)
+          read_directories(f_rel) unless self.dest.sub(/\/$/, '') == f_abs
+        elsif has_yaml_header?(f_abs)
+          pages << Page.new(self, self.source, dir, f)
+        else
+          static_files << StaticFile.new(self, self.source, dir, f)
         end
       end
     end
@@ -156,9 +169,7 @@ module Jekyll
     #
     # Returns nothing.
     def read_posts(dir)
-      base = File.join(self.source, dir, '_posts')
-      return unless File.exists?(base)
-      entries = Dir.chdir(base) { filter_entries(Dir['**/*']) }
+      entries = get_entries(dir, '_posts')
 
       # first pass processes, but does not yet render post content
       entries.each do |f|
@@ -166,19 +177,47 @@ module Jekyll
           post = Post.new(self, self.source, dir, f)
 
           if post.published && (self.future || post.date <= self.time)
-            self.posts << post
-            post.categories.each { |c| self.categories[c] << post }
-            post.tags.each { |c| self.tags[c] << post }
+            aggregate_post_info(post)
           end
         end
       end
+    end
 
-      self.posts.sort!
+    # Read all the files in <source>/<dir>/_drafts and create a new Post
+    # object with each one.
+    #
+    # dir - The String relative path of the directory to read.
+    #
+    # Returns nothing.
+    def read_drafts(dir)
+      entries = get_entries(dir, '_drafts')
 
-      # limit the posts if :limit_posts option is set
-      if limit_posts
-        limit = self.posts.length < limit_posts ? self.posts.length : limit_posts
-        self.posts = self.posts[-limit, limit]
+      # first pass processes, but does not yet render draft content
+      entries.each do |f|
+        if Draft.valid?(f)
+          draft = Draft.new(self, self.source, dir, f)
+
+          aggregate_post_info(draft)
+        end
+      end
+    end
+
+    # Read and parse all yaml files under <source>/<dir>
+    #
+    # Returns nothing
+    def read_data(dir)
+      base = File.join(self.source, dir)
+      return unless File.directory?(base) && (!self.safe || !File.symlink?(base))
+
+      entries = Dir.chdir(base) { Dir['*.{yaml,yml}'] }
+      entries.delete_if { |e| File.directory?(File.join(base, e)) }
+
+      entries.each do |entry|
+        path = File.join(self.source, dir, entry)
+        next if File.symlink?(path) && self.safe
+
+        key = sanitize_filename(File.basename(entry, '.*'))
+        self.data[key] = YAML.safe_load_file(path)
       end
     end
 
@@ -195,13 +234,11 @@ module Jekyll
     #
     # Returns nothing.
     def render
-      payload = site_payload
-      self.posts.each do |post|
-        post.render(self.layouts, payload)
-      end
+      relative_permalinks_deprecation_method
 
-      self.pages.each do |page|
-        page.render(self.layouts, payload)
+      payload = site_payload
+      [self.posts, self.pages].flatten.each do |page_or_post|
+        page_or_post.render(self.layouts, payload)
       end
 
       self.categories.values.map { |ps| ps.sort! { |a, b| b <=> a } }
@@ -214,47 +251,14 @@ module Jekyll
     #
     # Returns nothing.
     def cleanup
-      # all files and directories in destination, including hidden ones
-      dest_files = Set.new
-      Dir.glob(File.join(self.dest, "**", "*"), File::FNM_DOTMATCH) do |file|
-        dest_files << file unless file =~ /\/\.{1,2}$/
-      end
-
-      # files to be written
-      files = Set.new
-      self.posts.each do |post|
-        files << post.destination(self.dest)
-      end
-      self.pages.each do |page|
-        files << page.destination(self.dest)
-      end
-      self.static_files.each do |sf|
-        files << sf.destination(self.dest)
-      end
-
-      # adding files' parent directories
-      dirs = Set.new
-      files.each { |file| dirs << File.dirname(file) }
-      files.merge(dirs)
-
-      obsolete_files = dest_files - files
-
-      FileUtils.rm_rf(obsolete_files.to_a)
+      site_cleaner.cleanup!
     end
 
     # Write static files, pages, and posts.
     #
     # Returns nothing.
     def write
-      self.posts.each do |post|
-        post.write(self.dest)
-      end
-      self.pages.each do |page|
-        page.write(self.dest)
-      end
-      self.static_files.each do |sf|
-        sf.write(self.dest)
-      end
+      each_site_file { |item| item.write(self.dest) }
     end
 
     # Construct a Hash of Posts indexed by the specified Post attribute.
@@ -279,6 +283,14 @@ module Jekyll
       hash
     end
 
+    # Prepare site data for site payload. The method maintains backward compatibility
+    # if the key 'data' is already used in _config.yml.
+    #
+    # Returns the Hash to be hooked to site.data.
+    def site_data
+      self.config['data'] || self.data
+    end
+
     # The Hash payload containing site-wide data.
     #
     # Returns the Hash: { "site" => data } where data is a Hash with keys:
@@ -293,13 +305,15 @@ module Jekyll
     #   "tags"       - The Hash of tag values and Posts.
     #                  See Site#post_attr_hash for type info.
     def site_payload
-      {"site" => self.config.merge({
+      {"jekyll" => { "version" => Jekyll::VERSION },
+       "site" => self.config.merge({
           "time"       => self.time,
           "posts"      => self.posts.sort { |a, b| b <=> a },
           "pages"      => self.pages,
           "html_pages" => self.pages.reject { |page| !page.html? },
           "categories" => post_attr_hash('categories'),
-          "tags"       => post_attr_hash('tags')})}
+          "tags"       => post_attr_hash('tags'),
+          "data"       => site_data})}
     end
 
     # Filter out any files/directories that are hidden or backup files (start
@@ -311,14 +325,7 @@ module Jekyll
     #
     # Returns the Array of filtered entries.
     def filter_entries(entries)
-      entries = entries.reject do |e|
-        unless self.include.include?(e)
-          ['.', '_', '#'].include?(e[0..0]) ||
-          e[-1..-1] == '~' ||
-          self.exclude.include?(e) ||
-          File.symlink?(e)
-        end
-      end
+      EntryFilter.new(self).filter(entries)
     end
 
     # Get the implementation class for the given Converter.
@@ -333,6 +340,90 @@ module Jekyll
       else
         raise "Converter implementation not found for #{klass}"
       end
+    end
+
+    # Create array of instances of the subclasses of the class or module
+    #   passed in as argument.
+    #
+    # klass - class or module containing the subclasses which should be
+    #         instantiated
+    #
+    # Returns array of instances of subclasses of parameter
+    def instantiate_subclasses(klass)
+      klass.subclasses.select do |c|
+        !self.safe || c.safe
+      end.sort.map do |c|
+        c.new(self.config)
+      end
+    end
+
+    # Read the entries from a particular directory for processing
+    #
+    # dir - The String relative path of the directory to read
+    # subfolder - The String directory to read
+    #
+    # Returns the list of entries to process
+    def get_entries(dir, subfolder)
+      base = File.join(self.source, dir, subfolder)
+      return [] unless File.exists?(base)
+      entries = Dir.chdir(base) { filter_entries(Dir['**/*']) }
+      entries.delete_if { |e| File.directory?(File.join(base, e)) }
+    end
+
+    # Aggregate post information
+    #
+    # post - The Post object to aggregate information for
+    #
+    # Returns nothing
+    def aggregate_post_info(post)
+      self.posts << post
+      post.categories.each { |c| self.categories[c] << post }
+      post.tags.each { |c| self.tags[c] << post }
+    end
+
+    def relative_permalinks_deprecation_method
+      if config['relative_permalinks'] && has_relative_page?
+        $stderr.puts # Places newline after "Generating..."
+        Jekyll.logger.warn "Deprecation:", "Starting in 2.0, permalinks for pages" +
+                                            " in subfolders must be relative to the" +
+                                            " site source directory, not the parent" +
+                                            " directory. Check http://jekyllrb.com/docs/upgrading/"+
+                                            " for more info."
+        $stderr.print Jekyll.logger.formatted_topic("") + "..." # for "done."
+      end
+    end
+
+    def each_site_file
+      %w(posts pages static_files).each do |type|
+        self.send(type).each do |item|
+          yield item
+        end
+      end
+    end
+
+    private
+
+    def has_relative_page?
+      self.pages.any? { |page| page.uses_relative_permalinks }
+    end
+
+    def has_yaml_header?(file)
+      "---" == File.open(file) { |fd| fd.read(3) }
+    end
+
+    def limit_posts!
+      limit = self.posts.length < limit_posts ? self.posts.length : limit_posts
+      self.posts = self.posts[-limit, limit]
+    end
+
+    def site_cleaner
+      @site_cleaner ||= Cleaner.new(self)
+    end
+
+    def sanitize_filename(name)
+      name = name.gsub(/[^\w\s_-]+/, '')
+      name = name.gsub(/(^|\b\s)\s+($|\s?\b)/, '\\1\\2')
+      name = name.gsub(/\s+/, '_')
     end
   end
 end
