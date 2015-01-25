@@ -1,7 +1,7 @@
 module Jekyll
   module Converters
     class Markdown < Converter
-      safe true
+      safe false
 
       highlighter_prefix "\n"
       highlighter_suffix "\n"
