@@ -1,7 +1,7 @@
 module Jekyll
   module Converters
     class Textile < Converter
-      safe true
+      safe false
 
       highlighter_prefix '<notextile>'
       highlighter_suffix '</notextile>'
